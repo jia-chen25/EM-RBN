@@ -1,1 +1,431 @@
+import torch
+import time
+import torch.nn as nn
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+from utilities import create_save_path, gradients, Sampler, relative_error, mean_squared_error, to_device, wn_linear
+
+torch.manual_seed(1234)
+np.random.seed(1234)
+
+# Parameter
+a_1 = 1
+a_2 = 4
+lam = 1.0
+# domain
+bound_l = -1
+bound_r = 1
+bound_t = 1
+bound_d = -1
+layers = [2, 128, 1]
+batch_size = 10000
+bound_weight = 1
+c_x = [bound_l + bound_l / 10, bound_r + bound_r / 10]
+c_y = [bound_d + bound_d / 10, bound_t + bound_t / 10]
+
+
+# 中心点c： RBF中心点应该均匀分布  选择20*20的网格  在边界外侧增加一层RBF中心点
+# b: b=10  每个RBF覆盖至少15个样本点
+# a: 可训练参数
+class RBF_layer1(nn.Module):
+    def __init__(self, n_neu, c, device=None):
+        super(RBF_layer1, self).__init__()
+        if device is None:
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.device = device
+        self.n_neu = n_neu
+        self.c = c.to(device)  # 移动中心点到 GPU
+        self.b = nn.Parameter(torch.randn(1, n_neu, dtype=torch.float32, device=device), requires_grad=True)
+
+    def forward(self, inputs):
+        inputs = inputs.to(self.device)
+        t2 = (inputs[..., 0, None] ** 2 + inputs[..., 1, None] ** 2)
+        D = (self.c[None, 0, :] ** 2 + self.c[None, 1, :] ** 2)
+        t1 = (2 * torch.matmul(inputs, self.c))
+        return torch.exp((t1 - D - t2) * self.b ** 2)
+
+class PIRBN(torch.nn.Module):
+    def __init__(self, X, layers, device):
+        super().__init__()
+        self.device = device
+        self.X_mean = X.mean(0, keepdims=True).to(self.device)
+        self.X_std = X.std(0, keepdims=True).to(self.device)
+        self.n_in = layers[0]
+        self.n_out = layers[-1]
+        self.n_neu_x = 61  # RBF 网络在 x 和 y 方向上的神经元数量
+        self.n_neu_y = 61
+        self.b = 10  # 较大的计算域需要较小的b 源码中[-1.1, 1.1]对应的b=20 [-Π,Π] b=3.8
+        self.c, self.inputs_len = self.reviseC(c_x, c_y)  # RBF中心点c和其长度
+        self.layers = nn.ModuleList()
+        self.layers.append(RBF_layer1(self.inputs_len, self.c, device=self.device))
+        self.layers.append(nn.Linear(self.inputs_len, self.n_out, bias=False))
+        self.layers = nn.Sequential(*self.layers)
+        self.init_weights(self.layers)
+
+    def reviseC(self, c_x, c_y):
+        # RBF中心点坐标
+        c = np.zeros((2, self.n_neu_x * self.n_neu_y)).astype(dtype='float32')
+        k = 0
+        # x 和 y 方向上相邻中心点之间的间隔
+        dx = (c_x[1] - c_x[0]) / (self.n_neu_x - 1)
+        dy = (c_y[1] - c_y[0]) / (self.n_neu_y - 1)
+        # 遍历网格中的每个位置 计算对应的中心点坐标
+        for i in range(self.n_neu_x):
+            for j in range(self.n_neu_y):
+                c[0, k] = i * dx + c_x[0]
+                c[1, k] = j * dy + c_y[0]
+                k = k + 1
+
+        length = c.shape[1]
+        c = torch.tensor(c, device=self.device)
+        return c, length
+
+    def init_weights(self, layers):
+        b = (np.ones((1, self.inputs_len)) * self.b).astype(np.float32)
+        b = torch.from_numpy(b).to(self.device).requires_grad_(True)
+        layers[0].b.data = b
+
+    def forward(self, x):
+        x = x.to(self.device)
+        y = self.layers(x)
+        return y
+
+
+class ExpandingLayer(nn.Module):
+    def __init__(self):
+        super(ExpandingLayer, self).__init__()
+
+    def forward(self, x):
+        pow_xt = torch.pow(x, 2)  # 平方(x^2, t^2)
+        sin_xt = torch.sin(x)  # 正弦(sin(x), sin(t))
+        cos_xt = torch.cos(x)  # 余弦(cos(x), cos(t))
+        out = torch.cat([pow_xt, sin_xt, cos_xt, x], dim=1)
+        return out
+
+
+class DFSModified(torch.nn.Module):
+    def __init__(self, X, layers, device):
+        super().__init__()
+        # initial mean and std
+        self.X_mean = X.mean(0, keepdims=True).to(device)
+        self.X_std = X.std(0, keepdims=True).to(device)
+        self.expanding = ExpandingLayer()
+        layers = [8] + layers[1:]  # 第一层输入改为8
+        self.u = wn_linear(layers[0], layers[1]).to(device)
+        self.v = wn_linear(layers[0], layers[1]).to(device)
+        # build network
+        self.fnn = torch.nn.Sequential().to(device)
+        for i in range(len(layers) - 2):
+            self.fnn.add_module('dense_%d' % i, wn_linear(layers[i], layers[i + 1]).to(device))
+            self.fnn.add_module('tanh_%d' % i, torch.nn.Tanh())
+        self.fnn.add_module('dense_output', wn_linear(layers[-2], layers[-1]).to(device))
+
+    def forward(self, X):
+        H = (X - self.X_mean) / self.X_std
+        H = self.expanding(H)
+        u = torch.nn.Tanh()(self.u(H))
+        v = torch.nn.Tanh()(self.v(H))
+        for i in range(0, len(self.fnn) - 2, 2):
+            linear_layer = self.fnn[i]
+            activation_layer = self.fnn[i + 1]
+            H = linear_layer(H)
+            H = activation_layer(H)
+            H = H * u + (1 - H) * v
+
+        out = self.fnn[-1](H)
+        return out
+
+class CombinedNetwork(torch.nn.Module):
+    def __init__(self, X, layers, device=None, alpha=0.5):
+        super(CombinedNetwork, self).__init__()
+        if device is None:
+            device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        self.device = torch.device(device)
+        self.pirbn = PIRBN(X, layers, device=self.device)
+        self.dfsnet = DFSModified(X, layers, device=self.device)
+        # 将alpha转换为可训练参数，使用sigmoid约束在[0,1]范围内
+        self.raw_alpha = nn.Parameter(torch.tensor([self.inverse_sigmoid(alpha)],dtype=torch.float32, requires_grad=True, device=self.device))
+        self.temperature = nn.Parameter(torch.tensor(1.0), requires_grad=False).to(self.device)
+        # Small network to potentially make alpha input-dependent
+        self.alpha_network = nn.Sequential(
+            nn.Linear(layers[0], 16),
+            nn.Tanh(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()
+        ).to(self.device)
+        self.use_input_dependent_alpha = True  # Can be set to True for more complex weighting
+
+    def inverse_sigmoid(self, x):
+        return torch.log(torch.tensor(x / (1 - x + 1e-10)))
+
+    def forward(self, inputs):
+        pirbn_out = self.pirbn(inputs)
+        dfsnet_out = self.dfsnet(inputs)
+        if self.use_input_dependent_alpha:
+            alpha = self.alpha_network(inputs)
+        else:
+            alpha = torch.sigmoid(self.raw_alpha * self.temperature)
+        alpha = torch.clamp(alpha, 0.01, 0.99)
+        return alpha * pirbn_out + (1 - alpha) * dfsnet_out
+
+class PINNHelmholtz2D:
+    def __init__(self, network, dataset, batch_size=10000, bound_weight=1, log_path=None,
+                 model_path=None, pic_path=None, device="cuda:0"):
+        self.network = network.to(device)
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.bound_weight = bound_weight
+        self.log_path = log_path
+        self.model_path = model_path
+        self.pic_path = pic_path
+        self.device = torch.device(device)
+
+    def train(self, lr_rate, decay_factor, total_it, print_it, evaluate_it, pic_it, lr_it):
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=lr_rate)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, decay_factor)
+        self.logging('\nstart training...')
+        tic = time.time()
+        min_l2 = 99999
+        time1 = time.time()
+
+        for it in range(total_it):
+            loss_pde = self.pde_loss()
+            loss_bc = self.boundary_loss()
+            loss = loss_pde + self.bound_weight * loss_bc
+
+            # backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if it % print_it == 0:
+                self.logging(f'it {it}: loss {loss:.3e}, loss_pde {loss_pde:.3e}, '
+                             f'loss_bc {loss_bc:.3e}')
+
+            # evaluate
+            if it and it % evaluate_it == 0:
+                time2 = time.time()
+                self.logging(f'training time is:{time2 - time1}')
+                time1 = time2
+                l2_error = self.evaluation()
+
+                # save model
+                if l2_error < min_l2:
+                    min_l2 = l2_error
+                    self.save_model(it, min_l2)
+
+            # save picture
+            if it and it % pic_it == 0:
+                self.save_pic(it)
+
+            # update learning rate
+            if it and it % lr_it == 0:
+                scheduler.step()
+                self.logging("Update learning rate, lr: %2e" % scheduler.get_last_lr()[0])
+
+        toc = time.time()
+        self.logging(f'total training time: {toc - tic}')
+
+    def pde_loss(self):
+        # get mini batch in domain
+        X_pde, f_pde = self.dataset.get_pde_batch(self.batch_size)
+        X_pde = to_device(X_pde, self.device)
+        # pred U and compute residual loss
+        u_pred = self.network(X_pde)
+        residual = self.dataset.residual(X_pde, u_pred)
+        return mean_squared_error(residual, f_pde.to(self.device))
+
+    def boundary_loss(self):
+        # get mini batch in boundary
+        X_bound, u_bound = self.dataset.get_bound_batch(self.batch_size)
+        u_pred = self.network(X_bound.to(self.device))
+        return mean_squared_error(u_pred, u_bound.to(self.device))
+
+    def predict(self, X):  # prediction with no gradients
+        with torch.no_grad():
+            Y_pred = self.network(X)
+        return Y_pred
+
+    def evaluation(self):
+        self.network.eval()
+        # get mini batch for test
+        X_test, U_test = self.dataset.get_test_batch(self.batch_size)
+        # predict U
+        U_pred = self.predict(X_test.to(self.device))
+        # compute l2 error
+        error = relative_error(U_pred, U_test.to(self.device))
+        self.logging(f'l2 related error: {error:.3e}')
+        self.network.train()
+        return error.item()
+
+    def logging(self, log_item):
+        # write into consolo and file
+        with open(self.log_path, 'a+') as log:
+            log.write(log_item + '\n')
+        print(log_item)
+
+    def save_model(self, step, l2):
+        torch.save({'step': step, 'model': self.network.state_dict(), 'l2_error': l2}, self.model_path)
+        log_item = "Model checkpoint successful saved in %s" % self.model_path
+        self.logging(log_item)
+
+    def save_pic(self, it):
+        # 获取图像数据
+        x1, x2, X_star, U_star = self.dataset.get_img_batch(self.batch_size)
+        x1 = x1.cpu().numpy()  # 如果 x1 是张量，则需要转换为 NumPy 数组
+        x2 = x2.cpu().numpy()  # 如果 x2 是张量，则需要转换为 NumPy 数组
+        # 确保 X_star 和 U_star 在 CPU 上并转换为 NumPy 数组
+        X_star = X_star.cpu().numpy()  # 将 X_star 移动到 CPU 并转换为 NumPy 数组
+        U_star = U_star.cpu().numpy()  # 将 U_star 移动到 CPU 并转换为 NumPy 数组
+        # 预测 U
+        U_pred = self.predict(torch.tensor(X_star, dtype=torch.float32).to(self.device))
+        U_pred = U_pred.cpu().numpy()  # 将预测值从 GPU 移动到 CPU 并转换为 NumPy 数组
+        # 重新排列数据
+        U_star = griddata(X_star, U_star.flatten(), (x1, x2), method='cubic')
+        U_pred = griddata(X_star, U_pred.flatten(), (x1, x2), method='cubic')
+        # 绘制图像
+        plt.figure(1, figsize=(18, 5))
+        # 绘制真实解 u
+        plt.subplot(1, 3, 1)
+        plt.pcolor(x1, x2, U_star, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x_1$')
+        plt.ylabel(r'$x_2$')
+        plt.title('Exact $u(x)$')
+        # 绘制预测解 u
+        plt.subplot(1, 3, 2)
+        plt.pcolor(x1, x2, U_pred, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x_1$')
+        plt.ylabel(r'$x_2$')
+        plt.title('Predicted $u(x)$')
+        # 绘制绝对误差
+        plt.subplot(1, 3, 3)
+        plt.pcolor(x1, x2, np.abs(U_star - U_pred), cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x_1$')
+        plt.ylabel(r'$x_2$')
+        plt.title('Absolute error')
+        plt.tight_layout()
+        # 保存图片
+        fig_path = "test_%d.jpg" % (it)
+        plt.savefig(os.path.join(self.pic_path, fig_path))
+        self.logging("Pictures has been successfully saved in %s" % os.path.join(self.pic_path, fig_path))
+        plt.close('all')
+
+
+class DatasetHelmholtz2D:
+    def __init__(self, a_1, a_2, lam, bound_l, bound_r, bound_t, bound_d, device="cuda:0"):
+        self.a_1 = a_1
+        self.a_2 = a_2
+        self.lam = lam
+        self.bound_l = bound_l
+        self.bound_r = bound_r
+        self.bound_t = bound_t
+        self.bound_d = bound_d
+        self.device = torch.device(device)
+
+        # Domain boundaries
+        bc1_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_d]])
+        bc2_coords = np.array([[self.bound_r, self.bound_d], [self.bound_r, self.bound_t]])
+        bc3_coords = np.array([[self.bound_r, self.bound_t], [self.bound_l, self.bound_t]])
+        bc4_coords = np.array([[self.bound_l, self.bound_t], [self.bound_l, self.bound_d]])
+        dom_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_t]])
+
+        # Create boundary conditions samplers
+        self.bc1_sampler = Sampler(2, bc1_coords, lambda x: self.u(x), name='Dirichlet BC1')
+        self.bc2_sampler = Sampler(2, bc2_coords, lambda x: self.u(x), name='Dirichlet BC2')
+        self.bc3_sampler = Sampler(2, bc3_coords, lambda x: self.u(x), name='Dirichlet BC3')
+        self.bc4_sampler = Sampler(2, bc4_coords, lambda x: self.u(x), name='Dirichlet BC4')
+
+        # Create residual sampler
+        self.pde_sampler = Sampler(2, dom_coords, lambda x: self.f(x), name='Forcing')
+
+    def u(self, x):
+        # ground truth
+        return np.sin(self.a_1 * np.pi * x[:, 0:1]) * np.sin(self.a_2 * np.pi * x[:, 1:2])
+
+    def f(self, x):
+        # Forcing term
+        u_xx = (self.a_1 * np.pi) ** 2 * np.sin(self.a_1 * np.pi * x[:, 0:1]) * np.sin(self.a_2 * np.pi * x[:, 1:2])
+        u_yy = (self.a_2 * np.pi) ** 2 * np.sin(self.a_1 * np.pi * x[:, 0:1]) * np.sin(self.a_2 * np.pi * x[:, 1:2])
+        return - u_xx - u_yy + self.lam * self.u(x)
+
+    def residual(self, X, u):
+        u_x = gradients(u, X)[:, 0:1]
+        u_y = gradients(u, X)[:, 1:2]
+        u_xx = gradients(u_x, X)[:, 0:1]
+        u_yy = gradients(u_y, X)[:, 1:2]
+        residual = u_xx + u_yy + self.lam * u
+        return residual
+
+    def get_bound_batch(self, N):
+        N = N // 4
+
+        # sample points from boundary
+        bc1_x, bc1_u = self.bc1_sampler.sample(N)
+        bc2_x, bc2_u = self.bc2_sampler.sample(N)
+        bc3_x, bc3_u = self.bc3_sampler.sample(N)
+        bc4_x, bc4_u = self.bc4_sampler.sample(N)
+
+        # rearrange data
+        bc_x = np.concatenate([bc1_x, bc2_x, bc3_x, bc4_x])
+        bc_u = np.concatenate([bc1_u, bc2_u, bc3_u, bc4_u])
+
+        return (torch.tensor(bc_x, dtype=torch.float32).to(self.device),
+                torch.tensor(bc_u, dtype=torch.float32).to(self.device))
+
+    def get_pde_batch(self, N):
+        # sample points from training domain, residual = f
+        pde_x, pde_f = self.pde_sampler.sample(N)
+        return (torch.tensor(pde_x, dtype=torch.float32).to(self.device),
+                torch.tensor(pde_f, dtype=torch.float32).to(self.device))
+
+    def get_test_batch(self, N):
+        # sample batch for test
+        # X_star size = [N, 1], velocity_ref size = [N, 1]
+        nn = int(N ** 0.5)
+        # generate mesh
+        x1 = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        x2 = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x1, x2 = np.meshgrid(x1, x2)
+        x_star = np.hstack((x1.flatten()[:, None], x2.flatten()[:, None]))
+        u_star = self.u(x_star)
+        return (torch.tensor(x_star, dtype=torch.float32).to(self.device),
+                torch.tensor(u_star, dtype=torch.float32).to(self.device))
+
+    def get_img_batch(self, N):
+        # X_star size = [sqrt(N), sqrt(N)], velocity_ref size = [sqrt(N), sqrt(N)]
+        nn = int(N ** 0.5)
+        # generate mesh
+        x1 = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        x2 = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x1, x2 = np.meshgrid(x1, x2)
+        # rearrange data
+        x_star = np.hstack((x1.flatten()[:, None], x2.flatten()[:, None]))
+        u_star = self.u(x_star)
+        # (100, 100) (100, 100) (10000, 2) (10000, 1)
+        return (torch.tensor(x1, dtype=torch.float32).to(self.device),
+                torch.tensor(x2, dtype=torch.float32).to(self.device),
+                torch.tensor(x_star, dtype=torch.float32).to(self.device),
+                torch.tensor(u_star, dtype=torch.float32).to(self.device))
+
+
+if __name__ == '__main__':
+    # load device
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Use GPU: {torch.cuda.is_available()}\n")
+    # create save path
+    save_path = f"../output/Helmholtz2D-a1_{a_1}_a2_{a_2}/PIRBNModified_alpha_net/"
+    log_path, model_path, pic_path = create_save_path(save_path)
+    # load dataset
+    dataset = DatasetHelmholtz2D(a_1, a_2, lam, bound_l, bound_r, bound_t, bound_d)
+    X_star, U_star = dataset.get_test_batch(10000)
+    # create model
+    network = CombinedNetwork(X_star, layers, device).to(device)
+    pinn = PINNHelmholtz2D(network, dataset, batch_size, bound_weight, log_path, model_path, pic_path)
+    # train model
+    pinn.train(lr_rate=1e-3, decay_factor=0.5, total_it=25010, print_it=10, evaluate_it=100, pic_it=1000, lr_it=10000)
 
