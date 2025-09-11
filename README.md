@@ -1,7 +1,7 @@
 # EM-RBN: A Physics-Informed Neural Network Algorithm Based on Integrated Networks and Dynamic Weight Generation    
 This branch contains the code for paper: EM-RBN: A Physics-Informed Neural Network Algorithm Based on Integrated Networks and Dynamic Weight Generation  
 ![](https://github.com/jia-chen25/EM-RBN/blob/master/figure/Integrated%20Networks.png)  
-<p align="center">融合网络架构</p>  
+<p align="center">融合网络架构</p>   
 
 ![](https://github.com/jia-chen25/EM-RBN/blob/master/figure/Dynamic%20Weight%20Generation.png)  
 <p align="center">动态权重生成模块</p>  
