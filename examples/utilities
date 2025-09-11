@@ -1,0 +1,115 @@
+import torch
+import time
+import torch.nn as nn
+import numpy as np
+import os
+
+torch.manual_seed(1234)
+np.random.seed(1234)
+
+class Sampler:
+    def __init__(self, dim, coords, func, name=None):
+        self.dim = dim
+        self.coords = coords
+        self.func = func
+        self.name = name
+
+    def sample(self, N):
+        x = self.coords[0:1, :] + (self.coords[1:2, :] - self.coords[0:1, :]) * np.random.rand(N, self.dim)
+        u = self.func(x)
+        return x, u
+
+class NeuralNetwork(torch.nn.Module):
+    def __init__(self, X, layers, device):
+        '''
+        :param X:       total input data for standardization
+        :param layers:  [input dim] + number of layers * [number of cells] + [output dim]
+        :param device:  device
+        '''
+        super().__init__()
+        # initial mean and std
+        self.X_mean = X.mean(0, keepdims=True).to(device)
+        self.X_std = X.std(0, keepdims=True).to(device)
+        # build network
+        self.fnn = torch.nn.Sequential().to(device)
+        for i in range(len(layers) - 2):
+            self.fnn.add_module('dense_%d' % i, wn_linear(layers[i], layers[i + 1]))
+            self.fnn.add_module('tanh_%d' % i, torch.nn.Tanh())
+        self.fnn.add_module('dense_output', wn_linear(layers[-2], layers[-1]))
+
+    def forward(self, X):
+        H = (X - self.X_mean) / self.X_std
+        out = self.fnn(H)
+        return out
+
+
+def create_save_path(path):
+    '''
+    create the dirs for save the log, model and pics during training procession
+    :param path:
+    :return: return the file path for log and model, pic is a dir (log_file, model_file, pic_path)
+    '''
+    create_date = time.strftime("%Y_%m_%d_%H_%M_%S", time.localtime(time.time()))
+
+    # create path embedding with time stamp
+    log_path = os.path.join(path, "%s/log" % create_date)
+    model_path = os.path.join(path, "%s/model" % create_date)
+    pic_path = os.path.join(path, "%s/pic" % create_date)
+
+    # create dirs
+    if not os.path.exists(log_path):
+        os.makedirs(log_path)
+
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
+
+    if not os.path.exists(pic_path):
+        os.makedirs(pic_path)
+
+    # return the file path for log and model, pic is a dir
+    log_file = os.path.join(log_path, "log.txt")
+    model_file = os.path.join(model_path, "model.pt")
+    return log_file, model_file, pic_path
+
+
+def gradients(outputs, inputs):
+    return torch.autograd.grad(outputs, inputs, grad_outputs=torch.ones_like(outputs), create_graph=True)[0]
+
+
+def to_device(input, device):
+    # set input to device
+    input = input.clone().detach().to(device)
+    input.requires_grad_(True)
+    return input
+
+
+def to_numpy(input):
+    # transform tensor to numpy
+    if isinstance(input, torch.Tensor):
+        return input.detach().cpu().numpy()
+    elif isinstance(input, np.ndarray):
+        return input
+    else:
+        raise TypeError('Unknown type of input, expected torch.Tensor or np.ndarray, but got {}'.format(type(input)))
+
+
+def mean_squared_error(pred, exact):
+    if type(pred) is np.ndarray:
+        return np.mean(np.square(pred - exact))
+    return torch.mean(torch.square(pred - exact))
+
+
+def relative_error(pred, exact):
+    if type(pred) is np.ndarray:
+        return np.sqrt(np.mean(np.square(pred - exact)) / np.mean(np.square(exact)))
+    return torch.sqrt(torch.mean(torch.square(pred - exact)) / torch.mean(torch.square(exact)))
+
+
+def wn_linear(inputs_shape, outputs_shape):
+    # full connect layer with weight nomination
+    return torch.nn.utils.weight_norm(nn.Linear(inputs_shape, outputs_shape))
+
+
+def wn_linear_bias(in_features, out_features, bias=True):  # 添加bias参数，默认True
+    linear = nn.Linear(in_features, out_features, bias=bias)
+    return nn.utils.weight_norm(linear)
