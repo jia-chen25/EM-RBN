@@ -12,8 +12,8 @@ The usage instructions for this branch are consistent with those in the main bra
 The following table shows the performance of EM-RBN compared to Vanilla PINN and PIRBN on a set of benchmark problems. The accuracy is measured in relative $L^{2}$ error between the predicted and true solutions.  
 | Benchmark | EM-RBN | PIRBN | Vanilla PINN |
 | :-------: | :---: | :----: | :----------: |
-| Helmholtz2D($\alpha_{1}=1,\alpha_{2}=8$)|$7.45×10^{-3}$|$6.81×10^{-2}$| $1.51×10^{0}$ |
-| Helmholtz2D($\alpha_{1}=6,\alpha_{2}=6$) |$6.60×10^{-3}$|$1.05×10^{-2}$| $1.78×10^{0}$ |
+| Helmholtz2D($\alpha_{1}=1,\alpha_{2}=8$)|$7.45×10^{-3}$|$6.81×10^{-2}$| $1.51$ |
+| Helmholtz2D($\alpha_{1}=6,\alpha_{2}=6$) |$6.60×10^{-3}$|$1.05×10^{-2}$| $1.78$ |
 | Helmholtz2D($\alpha_{1}=1,\alpha_{2}=4$) |$9.97×10^{-3}$|$3.75×10^{-2}$|$9.59×10^{-2}$ |
 | Helmholtz2D($\alpha_{1}=2,\alpha_{2}=3$) |$9.71×10^{-3}$|$3.90×10^{-2}$|$7.98×10^{-2}$ |
 | Wave2D | $7.02×10^{-2}$| $2.09×10^{-1}$ | $4.90×10^{-1}$ |
