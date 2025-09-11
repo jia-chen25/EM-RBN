@@ -1,0 +1,421 @@
+import os
+import time
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+from utilities import relative_error, mean_squared_error, to_device, to_numpy, gradients
+
+ 
+class PINNHelmholtz2D():
+    def __init__(self, network, dataset, batch_size=10000, bound_weight=1, pseudo_weight=1, log_path=None,
+                 model_path=None, pic_path=None, device="cuda:0"):
+        self.network = network
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.bound_weight = bound_weight
+        self.pseudo_weight = pseudo_weight
+        self.log_path = log_path
+        self.model_path = model_path
+        self.pic_path = pic_path
+        self.device = device
+
+    def train(self, lr_rate, decay_factor, total_it, print_it, evaluate_it, pic_it, lr_it, pseudo_it):
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=lr_rate)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, decay_factor)
+        self.logging('\nstart training...')
+        tic = time.time()
+        min_l2 = 99999
+        time1 = time.time()
+
+        for it in range(total_it):
+            loss_pde = self.pde_loss()
+            loss_bc = self.boundary_loss()
+            loss_pseudo = self.pseudo_loss()
+            loss = loss_pde + self.bound_weight * loss_bc + self.pseudo_weight * loss_pseudo
+
+            # backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if it % print_it == 0:
+                self.logging(f'it {it}: loss {loss:.3e}, loss_pde {loss_pde:.3e}, '
+                             f'loss_bc {loss_bc:.3e}, loss_pseudo {loss_pseudo:.3e}')
+
+            # evaluate
+            if it and it % evaluate_it == 0:
+                time2 = time.time()
+                self.logging(f'training time is:{time2 - time1}')
+                time1 = time2
+                l2_error = self.evaluation()
+
+                # save model
+                if l2_error < min_l2:
+                    min_l2 = l2_error
+                    self.save_model(it, min_l2)
+
+            # save picture
+            if it and it % pic_it == 0:
+                self.save_pic(it)
+
+            # update pseudo points collection
+            if it and it % pseudo_it == 0:
+                self.pseudo_points_collection_update()
+                self.logging("Update pseudo points")
+
+            # update learning rate
+            if it and it % lr_it == 0:
+                scheduler.step()
+                self.logging("Update learning rate, lr: %2e" % scheduler.get_last_lr()[0])
+
+        toc = time.time()
+        self.logging(f'total training time: {toc - tic}')
+
+    def pseudo_points_collection_update(self):
+        """
+        更新伪点集合（pseudo points collection）中的标签，并控制伪点数量不超过预设的最大长度
+        """
+        # update all the label for pseudo points, constrain number of pseudo points into max len
+        # load all pseudo date form dataset
+        X_pseudo = self.dataset.get_pseudo_all()
+        X_pseudo = to_device(X_pseudo, self.device)
+
+        # compute network output and residual
+        u_pred = self.network(X_pseudo)
+        residual = self.dataset.residual(X_pseudo, u_pred)
+
+        # generate new pseudo points
+        self.dataset.pseudo_points_update(to_numpy(u_pred), to_numpy(residual))
+
+    def pseudo_loss(self):
+        # sample mini batch for pseudo points, and compute pseudo loss
+        if self.dataset.get_pseudo_len() != 0:
+            X_pseudo, u_pseudo = self.dataset.get_pseudo_batch(self.batch_size)
+            u_pred = self.network(X_pseudo.to(self.device))
+
+            return mean_squared_error(u_pred, u_pseudo.to(self.device))
+        return 0
+
+    def pde_loss(self):
+        # get mini batch in domain
+        X_pde, f_pde = self.dataset.get_pde_batch(self.batch_size)
+        X_pde = to_device(X_pde, self.device)
+        # pred U and compute residual loss
+        u_pred = self.network(X_pde)
+        residual = self.dataset.residual(X_pde, u_pred)
+        # generate new pseudo points
+        self.dataset.pseudo_points_generate(to_numpy(X_pde), to_numpy(u_pred), to_numpy(residual))
+        return mean_squared_error(residual, f_pde.to(self.device))
+
+    def boundary_loss(self):
+        # get mini batch in boundary
+        X_bound, u_bound = self.dataset.get_bound_batch(self.batch_size)
+        u_pred = self.network(X_bound.to(self.device))
+        return mean_squared_error(u_pred, u_bound.to(self.device))
+
+    def predict(self, X):  # prediction with no gradients
+        with torch.no_grad():
+            Y_pred = self.network(X)
+        return Y_pred
+
+    def evaluation(self):
+        self.network.eval()
+        # get mini batch for test
+        X_test, U_test = self.dataset.get_test_batch(self.batch_size)
+        # predict U
+        U_pred = self.predict(X_test.to(self.device))
+        # compute l2 error
+        error = relative_error(U_pred, U_test.to(self.device))
+        self.logging(f'l2 related error: {error:.3e}')
+        self.network.train()
+        return error.item()
+
+    def logging(self, log_item):
+        # write into consolo and file
+        with open(self.log_path, 'a+') as log:
+            log.write(log_item + '\n')
+        print(log_item)
+
+    def save_model(self, step, l2):
+        torch.save({'step': step, 'model': self.network.state_dict(), 'l2_error': l2}, self.model_path)
+        log_item = "Model checkpoint successful saved in %s" % self.model_path
+        self.logging(log_item)
+
+    def save_pic(self, it):
+        # get image data
+        x1, x2, X_star, U_star = self.dataset.get_img_batch(self.batch_size)
+        # predict U
+        U_pred = self.predict(torch.tensor(X_star, dtype=torch.float32).to(self.device))
+        print(f"x.shape={x1.shape},t.shape={x2.shape},X_star.shape={X_star.shape},"
+              f"U_star.shape={U_star.shape},U_pred.shape={U_pred.shape}")
+        # rearrange data
+        U_star = griddata(X_star, U_star.flatten(), (x1, x2), method='cubic')
+        U_pred = griddata(X_star, to_numpy(U_pred).flatten(), (x1, x2), method='cubic')
+
+        plt.figure(1, figsize=(18, 5))
+
+        # draw pic for real u
+        plt.subplot(1, 3, 1)
+        plt.pcolor(x1, x2, U_star, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x_1$')
+        plt.ylabel(r'$x_2$')
+        plt.title('Exact $u(x)$')
+        # draw pic for Predicted u
+        plt.subplot(1, 3, 2)
+        plt.pcolor(x1, x2, U_pred, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x_1$')
+        plt.ylabel(r'$x_2$')
+        plt.title('Predicted $u(x)$')
+
+        # draw pic for Absolute error
+        plt.subplot(1, 3, 3)
+        plt.pcolor(x1, x2, np.abs(U_star - U_pred), cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x_1$')
+        plt.ylabel(r'$x_2$')
+        plt.title('Absolute error')
+        plt.tight_layout()
+
+        # save pictures
+        fig_path = "test_%d.jpg" % (it)
+        plt.savefig(os.path.join(self.pic_path, fig_path))
+        self.logging("Pictures has been successfully saved in %s" % os.path.join(self.pic_path, fig_path))
+        plt.close('all')
+
+
+class PINNNavierStokes2D():
+    def __init__(self, network, dataset, batch_size=10000, bound_weight=1, pseudo_weight=1, log_path=None,
+                 model_path=None, pic_path=None, device="cuda:0"):
+        """
+        :param network:         network model
+        :param dataset:         dataset loader
+        :param batch_size:      batch size
+        :param bound_weight:    adaptive weight for equation loss
+        :param pseudo_weight:   adaptive weight for pseudo loss
+        :param log_path:        path for save log
+        :param model_path:      path for save model
+        :param pic_path:        path for save picture
+        :param device:          device
+        """
+        self.network = network
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.bound_weight = bound_weight
+        self.pseudo_weight = pseudo_weight
+        self.log_path = log_path
+        self.model_path = model_path
+        self.pic_path = pic_path
+        self.device = device
+
+    def train(self, lr_rate, decay_factor, total_it, print_it, evaluate_it, pic_it, lr_it, pseudo_it):
+        '''
+        :param lr_rate:
+        :param decay_factor:
+        :param total_it:
+        :param print_it:
+        :param evaluate_it:
+        :param pic_it:
+        :param lr_it:
+        :return:
+        '''
+        # optimizer
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=lr_rate)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, decay_factor)
+
+        self.logging('\nstart training...')
+        tic = time.time()
+        min_l2 = 99999
+        time1 = time.time()
+
+        # once iteration
+        for it in range(total_it):
+            # loss function
+            loss_pde = self.pde_loss()
+            loss_bound = self.bound_loss()
+            loss_pseudo = self.pseudo_loss()
+            loss = loss_pde + self.bound_weight * loss_bound + self.pseudo_weight * loss_pseudo
+
+            # backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if it % print_it == 0:
+                self.logging(f'it {it}: loss {loss:.3e}, loss pde {loss_pde:.3e}, '
+                             f'loss bc {loss_bound:.3e}, loss pseudo {loss_pseudo:.3e}')
+
+            # evaluate
+            if it and it % evaluate_it == 0:
+                time2 = time.time()
+                self.logging(f'training time is:{time2 - time1}')
+                time1 = time2
+                l2_error = self.evaluation()
+
+                # save model
+                if l2_error < min_l2:
+                    min_l2 = l2_error
+                    self.save_model(it, min_l2)
+
+            # save picture
+            if it and it % pic_it == 0:
+                self.save_pic(it)
+
+            # update pseudo points collection
+            if it and it % pseudo_it == 0:
+                self.pseudo_points_collection_update()
+                self.logging("Update pseudo points")
+
+            # update learning rate
+            if it and it % lr_it == 0:
+                scheduler.step()
+                self.logging("Update learning rate, lr: %2e" % scheduler.get_last_lr()[0])
+
+        toc = time.time()
+        self.logging(f'total training time: {toc - tic}')
+
+    def pseudo_points_collection_update(self):
+        # update all the label for pseudo points, constrain number of pseudo points into max len
+        # load all pseudo date form dataset
+        X_pseudo = self.dataset.get_pseudo_all()
+        X_pseudo = to_device(X_pseudo, self.device)
+
+        # compute network output and residual
+        PSI_pred = self.network(X_pseudo)
+        Ru_momentum, Rv_momentum = self.dataset.residual(X_pseudo, PSI_pred)
+        residual = torch.abs(Ru_momentum) + torch.abs(Rv_momentum)
+
+        # update pseudo points collections
+        self.dataset.pseudo_points_update(to_numpy(PSI_pred), to_numpy(residual))
+
+    def pseudo_loss(self):
+        # sample mini batch for pseudo points, and compute pseudo loss
+        if self.dataset.get_pseudo_len() != 0:
+            X_pseudo, PSI_pseudo = self.dataset.get_pseudo_batch(self.batch_size)
+            X_pseudo = to_device(X_pseudo, self.device)
+            PSI_pred = self.network(X_pseudo)
+
+            return mean_squared_error(PSI_pred, PSI_pseudo.to(self.device))
+        return 0
+
+    def pde_loss(self):
+        # get mini batch in domain
+        X_pde = self.dataset.get_pde_batch(self.batch_size)
+
+        # pred U and compute residual loss
+        X_pde = to_device(X_pde, self.device)
+        PSI_pred = self.network(X_pde)
+        Ru_momentum, Rv_momentum = self.dataset.residual(X_pde, PSI_pred)
+        residual = torch.abs(Ru_momentum) + torch.abs(Rv_momentum)
+
+        # generate new pseudo points
+        self.dataset.pseudo_points_generate(to_numpy(X_pde), to_numpy(PSI_pred), to_numpy(residual))
+
+        return mean_squared_error(Ru_momentum, 0) + mean_squared_error(Rv_momentum, 0)
+
+    def PSI2U(self, PSI, X):
+        # convect potential function PSI into physics field U
+        U_pred = gradients(PSI[:, 0], X)
+        u = U_pred[:, 1:2]
+        v = -U_pred[:, 0:1]
+        U = torch.concatenate((u, v), -1)
+
+        return U
+
+    def bound_loss(self):
+        # get mini batch in boundary
+        X_bound, U_bound = self.dataset.get_bound_batch(self.batch_size)
+
+        # pred potential function PSI, and convect into
+        X_bound = to_device(X_bound, self.device)
+        U_pred = self.predict(X_bound)
+
+        return mean_squared_error(U_pred, U_bound.to(self.device))
+
+    def predict(self, X):
+        # directly predicting physics fields
+        PSI_pred = self.network(X)
+        U_pred = self.PSI2U(PSI_pred, X)
+        return U_pred
+
+    def evaluation(self):
+        self.network.eval()
+
+        # get mini batch for test
+        X_test, velocity_ref = self.dataset.get_test_batch(self.batch_size)
+
+        # predict U
+        X_test = to_device(X_test, self.device)
+        U_pred = self.predict(X_test)
+
+        # convect into velocity
+        u_pred = U_pred[:, 0:1]
+        v_pred = U_pred[:, 1:2]
+        velocity_pred = torch.sqrt(u_pred ** 2 + v_pred ** 2)
+
+        # compute l2 error
+        error = relative_error(velocity_pred, velocity_ref.to(self.device))
+        self.logging(f'l2 related error: {error:.3e}')
+
+        self.network.train()
+        return error.item()
+
+    def logging(self, log_item):
+        # write into consolo and file
+        with open(self.log_path, 'a+') as log:
+            log.write(log_item + '\n')
+        print(log_item)
+
+    def save_model(self, step, l2):
+        torch.save({'step': step, 'model': self.network.state_dict(), 'l2_error': l2}, self.model_path)
+        log_item = "Model checkpoint successful saved in %s" % self.model_path
+        self.logging(log_item)
+
+    def save_pic(self, it):
+        # get image data
+        x1, x2, X_star, velocity_ref = self.dataset.get_img_batch(self.batch_size)
+
+        # predict U
+        X_star = to_device(X_star, self.device)
+        U_pred = self.predict(X_star)
+        U_pred, X_star = to_numpy(U_pred), to_numpy(X_star)
+
+        # compute velocity
+        velocity = np.sqrt(U_pred[:, 0:1] ** 2 + U_pred[:, 1:2] ** 2)
+        velocity_pred = griddata(X_star, velocity.flatten(), (x1, x2), method='cubic')
+
+        plt.figure(1, figsize=(18, 5))
+
+        # draw pic for real velocity
+        plt.subplot(1, 3, 1)
+        plt.pcolor(x1, x2, velocity_ref, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x$')
+        plt.ylabel(r'$y$')
+        plt.title('Exact $velocity(x)$')
+
+        # draw pic for Predicted velocity
+        plt.subplot(1, 3, 2)
+        plt.pcolor(x1, x2, velocity_pred, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x$')
+        plt.ylabel(r'$y$')
+        plt.title('Predicted $velocity(x)$')
+
+        # draw pic for Absolute error
+        plt.subplot(1, 3, 3)
+        plt.pcolor(x1, x2, np.abs(velocity_ref - velocity_pred), cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$x$')
+        plt.ylabel(r'$y$')
+        plt.title('Absolute error')
+        plt.tight_layout()
+
+        # save pictures
+        fig_path = "test_%d.jpg" % (it)
+        plt.savefig(os.path.join(self.pic_path, fig_path))
+        self.logging("Pictures has been successfully saved in %s" % os.path.join(self.pic_path, fig_path))
+
+        plt.close('all')
