@@ -1,0 +1,392 @@
+import torch
+import numpy as np
+from utilities import gradients, Sampler, to_numpy
+
+class DatasetHelmholtz2D:
+    def __init__(self, a_1, a_2, lam, bound_l, bound_r, bound_t, bound_d, pseudo_max_len, pseudo_update_rate):
+        # Parameter
+        """
+        这段代码定义了一个名为DatasetHelmholtz2D的类,用于生成和管理Helmholtz方程在二维空间中的边界条件、
+        残差项（即强迫项）样本，以及伪点（pseudo points）集合,这些常用于物理信息神经网络（PINNs）的训练
+        """
+        self.a_1 = a_1
+        self.a_2 = a_2
+        self.lam = lam
+        self.bound_l = bound_l
+        self.bound_r = bound_r
+        self.bound_t = bound_t
+        self.bound_d = bound_d
+
+        # Domain boundaries
+        bc1_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_d]])
+        bc2_coords = np.array([[self.bound_r, self.bound_d], [self.bound_r, self.bound_t]])
+        bc3_coords = np.array([[self.bound_r, self.bound_t], [self.bound_l, self.bound_t]])
+        bc4_coords = np.array([[self.bound_l, self.bound_t], [self.bound_l, self.bound_d]])
+
+        dom_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_t]])
+
+        # Create boundary conditions samplers
+        self.bc1_sampler = Sampler(2, bc1_coords, lambda x: self.u(x), name='Dirichlet BC1')
+        self.bc2_sampler = Sampler(2, bc2_coords, lambda x: self.u(x), name='Dirichlet BC2')
+        self.bc3_sampler = Sampler(2, bc3_coords, lambda x: self.u(x), name='Dirichlet BC3')
+        self.bc4_sampler = Sampler(2, bc4_coords, lambda x: self.u(x), name='Dirichlet BC4')
+
+        # Create residual sampler
+        self.pde_sampler = Sampler(2, dom_coords, lambda x: self.f(x), name='Forcing')
+
+        # create pseudo points collection
+        self.pseudo_points = np.zeros(0)
+        self.pseudo_labels = np.zeros(0)
+        self.pseudo_max_len = pseudo_max_len
+        self.pseudo_update_rate = pseudo_update_rate
+
+    def u(self, x):
+        # ground truth 解析解
+        return np.sin(self.a_1 * np.pi * x[:, 0:1]) * np.sin(self.a_2 * np.pi * x[:, 1:2])
+
+    def f(self, x):
+        # Forcing term
+        u_xx = (self.a_1 * np.pi) ** 2 * np.sin(self.a_1 * np.pi * x[:, 0:1]) * np.sin(self.a_2 * np.pi * x[:, 1:2])
+        u_yy = (self.a_2 * np.pi) ** 2 * np.sin(self.a_1 * np.pi * x[:, 0:1]) * np.sin(self.a_2 * np.pi * x[:, 1:2])
+        return - u_xx - u_yy + self.lam * self.u(x)
+
+    def residual(self, X, u):
+        '''
+        :param X: [x, y]
+        :param u: [u]
+        :return:
+        '''
+        u_x = gradients(u, X)[:, 0:1]
+        u_y = gradients(u, X)[:, 1:2]
+        u_xx = gradients(u_x, X)[:, 0:1]
+        u_yy = gradients(u_y, X)[:, 1:2]
+        residual = u_xx + u_yy + self.lam * u
+        return residual
+
+    def get_pseudo_batch(self, N):
+        # if pseudo points < batch size, return all the pseudo points
+        if self.get_pseudo_len() < N:
+            return torch.tensor(self.pseudo_points), torch.tensor(self.pseudo_labels)
+
+        # random sample pseudo points
+        random_idx = torch.randint(0, self.get_pseudo_len(), (N,))
+        batch_points = self.pseudo_points[random_idx]
+        batch_labels = self.pseudo_labels[random_idx]
+
+        return torch.tensor(batch_points, dtype=torch.float32), torch.tensor(batch_labels, dtype=torch.float32)
+
+    def get_pseudo_all(self):
+        # get all pseudo points
+        return torch.tensor(self.pseudo_points, dtype=torch.float32)
+
+    def get_pseudo_len(self):
+        # get length of pseudo points
+        return self.pseudo_points.shape[0]
+
+    def pseudo_points_generate(self, X, u, residual_loss):
+        '''
+        generate new pseudo points
+        :param X:               the network input X [x, y]
+        :param u:               the network output u [u]
+        :param residual_loss:   residual loss of each point
+        :return:
+        '''
+        # update number of each time
+        update_num = int(self.pseudo_update_rate * self.pseudo_max_len)
+
+        # sort all the residual loss
+        residual_loss = to_numpy(residual_loss).reshape(1, -1)
+        idx_pseudo = np.argpartition(residual_loss, update_num)[0, :update_num]
+
+        # select top update_num points as pseudo candidate
+        candidate_points = X[idx_pseudo]
+        candidate_labels = u[idx_pseudo]
+
+        # the first time generate pseudo points
+        if self.pseudo_points.shape[0] == 0:
+            self.pseudo_points = candidate_points
+            self.pseudo_labels = candidate_labels
+        # append new candidate
+        else:
+            self.pseudo_points = np.concatenate((self.pseudo_points, candidate_points), 0)
+            self.pseudo_labels = np.concatenate((self.pseudo_labels, candidate_labels), 0)
+
+    def pseudo_points_update(self, u_pred, residual_loss):
+        '''
+        update all the label for pseudo points, constrain number of pseudo points into max len
+        :param u_pred:          new prediction
+        :param residual_loss:   residual loss
+        :return:
+        '''
+        if self.get_pseudo_len() > self.pseudo_max_len:
+            # selected the pseudo point and sorted by residual loss
+            residual_loss = to_numpy(residual_loss).reshape(1, -1)
+            idx_pseudo = np.argpartition(residual_loss, self.pseudo_max_len)[0, :self.pseudo_max_len]
+
+            # update both points and labels
+            self.pseudo_points = self.pseudo_points[idx_pseudo]
+            self.pseudo_labels = u_pred[idx_pseudo]
+
+        # update labels only
+        else:
+            self.pseudo_labels = u_pred
+
+    def get_bound_batch(self, N):
+        # four boundaries has the same number of points
+        N = N // 4
+
+        # sample points from boundary
+        bc1_x, bc1_u = self.bc1_sampler.sample(N)
+        bc2_x, bc2_u = self.bc2_sampler.sample(N)
+        bc3_x, bc3_u = self.bc3_sampler.sample(N)
+        bc4_x, bc4_u = self.bc4_sampler.sample(N)
+
+        # rearrange data
+        bc_x = np.concatenate([bc1_x, bc2_x, bc3_x, bc4_x])
+        bc_u = np.concatenate([bc1_u, bc2_u, bc3_u, bc4_u])
+
+        return torch.tensor(bc_x, dtype=torch.float32), torch.tensor(bc_u, dtype=torch.float32)
+
+    def get_pde_batch(self, N):
+        # sample points from training domain, residual = f
+        pde_x, pde_f = self.pde_sampler.sample(N)
+        return (torch.tensor(pde_x, dtype=torch.float32),
+                torch.tensor(pde_f, dtype=torch.float32))
+
+    def get_test_batch(self, N):
+        # sample batch for test
+        # X_star size = [N, 1], velocity_ref size = [N, 1]
+        nn = int(N ** (0.5))
+        # generate mesh
+        x1 = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        x2 = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x1, x2 = np.meshgrid(x1, x2)
+        x_star = np.hstack((x1.flatten()[:, None], x2.flatten()[:, None]))
+        u_star = self.u(x_star)
+        return (torch.tensor(x_star, dtype=torch.float32),
+                torch.tensor(u_star, dtype=torch.float32))
+
+    def get_img_batch(self, N):
+        # sample batch for create image
+        # X_star size = [sqrt(N), sqrt(N)], velocity_ref size = [sqrt(N), sqrt(N)]
+        nn = int(N ** (0.5))
+        # generate mesh
+        x1 = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        x2 = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x1, x2 = np.meshgrid(x1, x2)
+        # rearrange data
+        x_star = np.hstack((x1.flatten()[:, None], x2.flatten()[:, None]))
+        u_star = self.u(x_star)
+        return x1, x2, x_star, u_star
+
+
+class DatasetNavierStokes2D:
+    def __init__(self, Re, bound_l, bound_r, bound_t, bound_d, u_path, v_path, pseudo_max_len, pseudo_update_rate):
+        # Parameter
+        self.Re = Re
+        self.bound_l = bound_l
+        self.bound_r = bound_r
+        self.bound_t = bound_t
+        self.bound_d = bound_d
+
+        # Domain boundaries
+        bc1_coords = np.array([[self.bound_l, self.bound_t], [self.bound_r, self.bound_t]])
+        bc2_coords = np.array([[self.bound_l, self.bound_d], [self.bound_l, self.bound_t]])
+        bc3_coords = np.array([[self.bound_r, self.bound_d], [self.bound_r, self.bound_t]])
+        bc4_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_d]])
+
+        dom_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_t]])
+
+        # Create boundary conditions samplers
+        self.bc1_sampler = Sampler(2, bc1_coords, lambda x: self.U_gamma_1(x), name='Dirichlet BC1')
+        self.bc2_sampler = Sampler(2, bc2_coords, lambda x: self.U_gamma_2(x), name='Dirichlet BC2')
+        self.bc3_sampler = Sampler(2, bc3_coords, lambda x: self.U_gamma_2(x), name='Dirichlet BC3')
+        self.bc4_sampler = Sampler(2, bc4_coords, lambda x: self.U_gamma_2(x), name='Dirichlet BC4')
+
+        # Create residual sampler
+        self.pde_sampler = Sampler(2, dom_coords, lambda x: self.f(x), name='Forcing')
+
+        # test data
+        self.u_ref = np.genfromtxt(u_path, delimiter=',')
+        self.v_ref = np.genfromtxt(v_path, delimiter=',')
+        self.velocity_ref = np.sqrt(self.u_ref ** 2 + self.v_ref ** 2).T
+
+        # create pseudo points collection
+        self.pseudo_points = np.zeros(0)
+        self.pseudo_labels = np.zeros(0)
+        self.pseudo_max_len = pseudo_max_len
+        self.pseudo_update_rate = pseudo_update_rate
+
+    def U_gamma_1(self, x):
+        # boundary conditional 1
+        num = x.shape[0]
+        return np.tile(np.array([1.0, 0.0]), (num, 1))
+
+    def U_gamma_2(self, x):
+        # boundary conditional 2
+        num = x.shape[0]
+        return np.zeros((num, 2))
+
+    def f(self, x):
+        # Forcing term
+        num = x.shape[0]
+        return np.zeros((num, 2))
+
+    def residual(self, X, PSI):
+        '''
+        :param X: [x, y]
+        :param PSI: [psi, p]
+        :return:
+        '''
+        U = gradients(PSI[:, 0], X)
+        u = U[:, 1]
+        v = -U[:, 0]
+
+        u_X = gradients(u, X)
+        u_x = u_X[:, 0]
+        u_y = u_X[:, 1]
+
+        v_X = gradients(v, X)
+        v_x = v_X[:, 0]
+        v_y = v_X[:, 1]
+
+        p_X = gradients(PSI[:, 1], X)
+        p_x = p_X[:, 0]
+        p_y = p_X[:, 1]
+
+        u_xX = gradients(u_x, X)
+        u_xx = u_xX[:, 0]
+
+        u_yX = gradients(u_y, X)
+        u_yy = u_yX[:, 1]
+
+        v_xX = gradients(v_x, X)
+        v_xx = v_xX[:, 0]
+
+        v_yX = gradients(v_y, X)
+        v_yy = v_yX[:, 1]
+
+        Ru_momentum = u * u_x + v * u_y + p_x - (u_xx + u_yy) / self.Re
+        Rv_momentum = u * v_x + v * v_y + p_y - (v_xx + v_yy) / self.Re
+
+        return Ru_momentum, Rv_momentum
+
+    def get_pseudo_batch(self, N):
+        # if pseudo points < batch size, return all the pseudo points
+        if self.get_pseudo_len() < N:
+            return torch.tensor(self.pseudo_points), torch.tensor(self.pseudo_labels)
+
+        # random sample pseudo points
+        random_idx = torch.randint(0, self.get_pseudo_len(), (N,))
+        batch_points = self.pseudo_points[random_idx]
+        batch_labels = self.pseudo_labels[random_idx]
+
+        return torch.tensor(batch_points, dtype=torch.float32), torch.tensor(batch_labels, dtype=torch.float32)
+
+    def get_pseudo_all(self):
+        # get all pseudo points
+        return torch.tensor(self.pseudo_points, dtype=torch.float32)
+
+    def get_pseudo_len(self):
+        # get length of pseudo points
+        return self.pseudo_points.shape[0]
+
+    def pseudo_points_generate(self, X, PSI, residual_loss):
+        '''
+        generate new pseudo points
+        :param X:               the network input X [x, y]
+        :param PSI:             the network output PSI [psi, p]
+        :param residual_loss:   residual loss of each point
+        :return:
+        '''
+        # update number of each time
+        update_num = int(self.pseudo_update_rate * self.pseudo_max_len)
+
+        # sort all the residual loss
+        residual_loss = to_numpy(residual_loss).reshape(1, -1)
+        idx_pseudo = np.argpartition(residual_loss, update_num)[0, :update_num]
+
+        # select top update_num points as pseudo candidate
+        candidate_points = X[idx_pseudo]
+        candidate_labels = PSI[idx_pseudo]
+
+        # the first time generate pseudo points
+        if self.pseudo_points.shape[0] == 0:
+            self.pseudo_points = candidate_points
+            self.pseudo_labels = candidate_labels
+        # append new candidate
+        else:
+            self.pseudo_points = np.concatenate((self.pseudo_points, candidate_points), 0)
+            self.pseudo_labels = np.concatenate((self.pseudo_labels, candidate_labels), 0)
+
+    def pseudo_points_update(self, U_pred, residual_loss):
+        '''
+        update all the label for pseudo points, constrain number of pseudo points into max len
+        :param U_pred:          new prediction
+        :param residual_loss:   residual loss
+        :return:
+        '''
+        if self.get_pseudo_len() > self.pseudo_max_len:
+            # selected the pseudo point and sorted by residual loss
+            residual_loss = to_numpy(residual_loss).reshape(1, -1)
+            idx_pseudo = np.argpartition(residual_loss, self.pseudo_max_len)[0, :self.pseudo_max_len]
+
+            # update both points and labels
+            self.pseudo_points = self.pseudo_points[idx_pseudo]
+            self.pseudo_labels = U_pred[idx_pseudo]
+
+        # update labels only
+        else:
+            self.pseudo_labels = U_pred
+
+    def get_bound_batch(self, N):
+        # four boundaries has the same number of points
+        N = N // 4
+
+        # sample points from boundary
+        bc1_x, bc1_u = self.bc1_sampler.sample(N)
+        bc2_x, bc2_u = self.bc2_sampler.sample(N)
+        bc3_x, bc3_u = self.bc3_sampler.sample(N)
+        bc4_x, bc4_u = self.bc4_sampler.sample(N)
+
+        # rearrange data
+        bc_x = np.concatenate([bc1_x, bc2_x, bc3_x, bc4_x])
+        bc_u = np.concatenate([bc1_u, bc2_u, bc3_u, bc4_u])
+
+        return torch.tensor(bc_x, dtype=torch.float32), torch.tensor(bc_u, dtype=torch.float32)
+
+    def get_pde_batch(self, N):
+        # sample points from training domain, residual = 0
+        pde_x, _ = self.pde_sampler.sample(N)
+        return torch.tensor(pde_x, dtype=torch.float32)
+
+    def get_test_batch(self, N):
+        # sample batch for test
+        # X_star size = [N, 1], velocity_ref size = [N, 1]
+        nn = int(N ** (0.5))
+
+        # generate mesh
+        x = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        y = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x, y = np.meshgrid(x, y)
+
+        # sample X and V
+        X_star = np.hstack((x.flatten()[:, None], y.flatten()[:, None]))
+        velocity_ref = self.velocity_ref.flatten()[:, None]
+
+        return torch.tensor(X_star, dtype=torch.float32), torch.tensor(velocity_ref, dtype=torch.float32)
+
+    def get_img_batch(self, N):
+        # sample batch for create image
+        # X_star size = [sqrt(N), sqrt(N)], velocity_ref size = [sqrt(N), sqrt(N)]
+        nn = int(N ** (0.5))
+
+        # generate mesh
+        x = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        y = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x, y = np.meshgrid(x, y)
+
+        # rearrange data
+        X_star = np.hstack((x.flatten()[:, None], y.flatten()[:, None]))
+
+        return x, y, torch.tensor(X_star, dtype=torch.float32), self.velocity_ref
