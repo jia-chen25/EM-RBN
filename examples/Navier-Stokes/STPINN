@@ -1,1 +1,42 @@
+import torch
+from utilities import NeuralNetwork, create_save_path
+from dataset import DatasetNavierStokes2D
+from model import PINNNavierStokes2D
+
+# path
+u_path = "../input/reference_u.csv"
+v_path = "../input/reference_v.csv"
+save_path = "../output/NavierStokes2D/STPINN/"
+
+# Parameter
+Re = 100
+bound_l = 0
+bound_r = 1
+bound_t = 1
+bound_d = 0
+layers = [2, 50, 50, 50, 2]
+batch_size = 10000
+bound_weight = 1
+pseudo_weight = 1
+# pseudo strategy
+pseudo_max_len = batch_size * 2
+pseudo_update_rate = 0.01
+
+if __name__ == '__main__':
+    # load device
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Use GPU: {torch.cuda.is_available()}\n")
+    # create save path
+    log_path, model_path, pic_path = create_save_path(save_path)
+    # load dataset
+    dataset = DatasetNavierStokes2D(Re, bound_l, bound_r, bound_t, bound_d, u_path, v_path, pseudo_max_len,
+                                    pseudo_update_rate)
+    X_star = dataset.get_pde_batch(10000)
+    # create model
+    network = NeuralNetwork(X_star, layers, device).to(device)
+    pinn = PINNNavierStokes2D(network, dataset, batch_size, bound_weight, pseudo_weight, log_path, model_path, pic_path,
+                              device)
+    # train model
+    pinn.train(lr_rate=1e-3, decay_factor=0.5, total_it=15010, print_it=10, evaluate_it=100, pic_it=1000, lr_it=10000,
+               pseudo_it=100)
 
