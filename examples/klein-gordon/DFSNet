@@ -1,0 +1,322 @@
+import os
+import time
+import torch
+import numpy as np
+import torch.nn as nn
+import matplotlib.pyplot as plt
+from scipy.interpolate import griddata
+from utilities import create_save_path, gradients, Sampler, relative_error, mean_squared_error, to_device, wn_linear, to_numpy
+
+torch.manual_seed(1234)
+np.random.seed(1234)
+
+# Parameter
+a = 5
+# domain
+bound_l = 0
+bound_r = 1
+bound_t = 1
+bound_d = 0
+layers = [2, 128, 128, 128, 1]
+batch_size = 10000
+bound_weight = 1
+ic_weight = 1
+
+
+class ExpandingLayer(nn.Module):
+    def __init__(self):
+        super(ExpandingLayer, self).__init__()
+
+    def forward(self, x):
+        # 计算各项特征
+        pow_xt = torch.pow(x, 2)  # 平方(x^2, t^2)
+        sin_xt = torch.sin(x)  # 正弦(sin(x), sin(t))
+        cos_xt = torch.cos(x)  # 余弦(cos(x), cos(t))
+        # 拼接所有特征
+        out = torch.cat([pow_xt, sin_xt, cos_xt, x], dim=1)
+        return out
+
+
+class NeuralNetwork(torch.nn.Module):
+    def __init__(self, X, layers, device):
+        super().__init__()
+        self.device = device  # 确保 device 是一个 PyTorch 设备对象
+        # initial mean and std
+        self.X_mean = X.mean(0, keepdims=True).to(self.device)
+        self.X_std = X.std(0, keepdims=True).to(self.device)
+        # 添加Expanding layer
+        self.expanding = ExpandingLayer().to(self.device)
+        # 调整第一层的输入维度(原始输入是2维，经过Expanding后变为8维)
+        # 所以需要修改第一层的输入维度
+        adjusted_layers = [8] + layers[1:]  # 第一层输入改为8
+        self.fnn = torch.nn.Sequential().to(device)
+        for i in range(len(adjusted_layers) - 2):
+            self.fnn.add_module('dense_%d' % i, wn_linear(adjusted_layers[i], adjusted_layers[i + 1]).to(self.device))
+            self.fnn.add_module('tanh_%d' % i, torch.nn.Tanh())
+        self.fnn.add_module('dense_output', wn_linear(adjusted_layers[-2], adjusted_layers[-1]).to(self.device))
+
+    def forward(self, X):
+        X = X.to(self.device)
+        H = (X - self.X_mean) / self.X_std
+        H = self.expanding(H)
+        out = self.fnn(H)
+        return out
+
+class PINNKG():
+    def __init__(self, network, dataset, batch_size=10000, bound_weight=1, ic_weight=1, log_path=None,
+                 model_path=None, pic_path=None, device="cuda:0"):
+        self.network = network.to(device)
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.bound_weight = bound_weight
+        self.ic_weight = ic_weight
+        self.log_path = log_path
+        self.model_path = model_path
+        self.pic_path = pic_path
+        self.device = torch.device(device)
+
+    def train(self, lr_rate, decay_factor, total_it, print_it, evaluate_it, pic_it, lr_it):
+        optimizer = torch.optim.Adam(self.network.parameters(), lr=lr_rate)
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, decay_factor)
+        self.logging('\nstart training...')
+        tic = time.time()
+        min_l2 = 99999
+        time1 = time.time()
+
+        for it in range(total_it):
+            loss_pde = self.pde_loss()
+            loss_bc = self.boundary_loss()
+            loss_ic = self.ic_loss()
+            loss = loss_pde + self.bound_weight * loss_bc + self.ic_weight * loss_ic
+
+            # backpropagation
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if it % print_it == 0:
+                self.logging(f'it {it}: loss {loss:.3e}, loss_pde {loss_pde:.3e}, '
+                             f'loss_bc {loss_bc:.3e}, loss_ic {loss_ic:.3e}')
+
+            # evaluate
+            if it and it % evaluate_it == 0:
+                time2 = time.time()
+                self.logging(f'training time is:{time2 - time1}')
+                time1 = time2
+                l2_error = self.evaluation()
+
+                # save model
+                if l2_error < min_l2:
+                    min_l2 = l2_error
+                    self.save_model(it, min_l2)
+
+            # save picture
+            if it and it % pic_it == 0:
+                self.save_pic(it)
+
+            # update learning rate
+            if it and it % lr_it == 0:
+                scheduler.step()
+                self.logging("Update learning rate, lr: %2e" % scheduler.get_last_lr()[0])
+
+        toc = time.time()
+        self.logging(f'total training time: {toc - tic}')
+
+    def pde_loss(self):
+        # get mini batch in domain
+        X_pde, f_pde = self.dataset.get_pde_batch(self.batch_size)
+        X_pde = to_device(X_pde, self.device)
+        # pred U and compute residual loss
+        u_pred = self.network(X_pde)
+        residual = self.dataset.residual(X_pde, u_pred)
+        return mean_squared_error(residual, f_pde.to(self.device))
+
+    def boundary_loss(self):
+        # get mini batch in boundary
+        X_bound, u_bound = self.dataset.get_bound_batch(self.batch_size)
+        u_pred = self.network(X_bound.to(self.device))
+        return mean_squared_error(u_pred, u_bound.to(self.device))
+
+    def ic_loss(self):
+        X_ic, u_ic = self.dataset.get_ic_batch(self.batch_size)
+        u_pred = self.network(X_ic.to(self.device))
+        return mean_squared_error(u_pred, u_ic.to(self.device))
+
+    def predict(self, X):  # prediction with no gradients
+        with torch.no_grad():
+            Y_pred = self.network(X)
+        return Y_pred
+
+    def evaluation(self):
+        self.network.eval()
+        # get mini batch for test
+        X_test, U_test = self.dataset.get_test_batch(self.batch_size)
+        # predict U
+        U_pred = self.predict(X_test.to(self.device))
+        # compute l2 error
+        error = relative_error(U_pred, U_test.to(self.device))
+        self.logging(f'l2 related error: {error:.3e}')
+        self.network.train()
+        return error.item()
+
+    def logging(self, log_item):
+        # write into consolo and file
+        with open(self.log_path, 'a+') as log:
+            log.write(log_item + '\n')
+        print(log_item)
+
+    def save_model(self, step, l2):
+        torch.save({'step': step, 'model': self.network.state_dict(), 'l2_error': l2}, self.model_path)
+        log_item = "Model checkpoint successful saved in %s" % self.model_path
+        self.logging(log_item)
+
+    def save_pic(self, it):
+        # get image data
+        x1, x2, X_star, U_star = self.dataset.get_img_batch(self.batch_size)
+        # # (100, 100) (100, 100) (10000, 2) (10000, 1)
+        # predict U
+        U_pred = self.predict(torch.tensor(X_star, dtype=torch.float32).to(self.device))
+        # rearrange data
+        U_star = griddata(X_star, U_star.flatten(), (x1, x2), method='cubic')
+        U_pred = griddata(X_star, to_numpy(U_pred).flatten(), (x1, x2), method='cubic')
+        # print(x1.shape, x2.shape, X_star.shape, U_star.shape, U_pred.shape)
+        # (100, 100) (100, 100) (10000, 2) (100, 100) (100, 100)
+        plt.figure(1, figsize=(18, 5))
+
+        # draw pic for real u
+        plt.subplot(1, 3, 1)
+        plt.pcolor(x1, x2, U_star, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$t$')
+        plt.ylabel(r'$x$')
+        plt.title('Exact $u(t,x)$')
+        # draw pic for Predicted u
+        plt.subplot(1, 3, 2)
+        plt.pcolor(x1, x2, U_pred, cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$t$')
+        plt.ylabel(r'$x$')
+        plt.title('Predicted $u(t,x)$')
+
+        # draw pic for Absolute error
+        plt.subplot(1, 3, 3)
+        plt.pcolor(x1, x2, np.abs(U_star - U_pred), cmap='jet')
+        plt.colorbar()
+        plt.xlabel(r'$t$')
+        plt.ylabel(r'$x$')
+        plt.title('Absolute error')
+        plt.tight_layout()
+
+        # save pictures
+        fig_path = "test_%d.jpg" % (it)
+        plt.savefig(os.path.join(self.pic_path, fig_path))
+        self.logging("Pictures has been successfully saved in %s" % os.path.join(self.pic_path, fig_path))
+        plt.close('all')
+
+
+class DatasetKG:
+    def __init__(self, a, bound_l, bound_r, bound_t, bound_d):
+        self.a = a
+        self.bound_l = bound_l
+        self.bound_r = bound_r
+        self.bound_t = bound_t
+        self.bound_d = bound_d
+
+        # Domain boundaries 下 上 左
+        bc1_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_d]])
+        bc2_coords = np.array([[self.bound_l, self.bound_t], [self.bound_r, self.bound_t]])
+        ic_coords = np.array([[self.bound_l, self.bound_d], [self.bound_l, self.bound_t]])
+
+        dom_coords = np.array([[self.bound_l, self.bound_d], [self.bound_r, self.bound_t]])
+
+        # Create boundary conditions samplers
+        self.bc1_sampler = Sampler(2, bc1_coords, lambda x: self.u(x), name='Dirichlet BC1')
+        self.bc2_sampler = Sampler(2, bc2_coords, lambda x: self.u(x), name='Dirichlet BC2')
+        self.ic_sampler = Sampler(2, ic_coords, lambda x: self.u(x), name='Dirichlet BC3')
+
+        # Create residual sampler
+        self.pde_sampler = Sampler(2, dom_coords, lambda x: self.f(x), name='Forcing')
+
+    def u(self, x):
+        # ground truth 解析解
+        return x[:, 1:2] * np.cos(self.a * np.pi * x[:, 0:1]) + (x[:, 1:2] * x[:, 0:1]) ** 3
+
+    def f(self, x):
+        # Forcing term
+        u_tt = -x[:, 1:2] * (5 * np.pi) ** 2 * np.cos(5 * np.pi * x[:, 0:1]) + 6 * x[:, 0:1] * x[:, 1:2] ** 3
+        u_xx = 6 * x[:, 1:2] * x[:, 0:1] ** 3
+        return u_tt - u_xx + self.u(x) ** 3
+
+    def residual(self, X, u):
+        u_x = gradients(u, X)[:, 1:2]
+        u_t = gradients(u, X)[:, 0:1]
+        u_xx = gradients(u_x, X)[:, 1:2]
+        u_tt = gradients(u_t, X)[:, 0:1]
+        residual = u_tt - u_xx + u ** 3
+        return residual
+
+    def get_pde_batch(self, N):
+        # sample points from training domain, residual = f
+        pde_x, pde_f = self.pde_sampler.sample(N)
+        return (torch.tensor(pde_x, dtype=torch.float32),
+                torch.tensor(pde_f, dtype=torch.float32))
+
+    def get_bound_batch(self, N):
+        N = N // 2
+
+        # sample points from boundary
+        bc1_x, bc1_u = self.bc1_sampler.sample(N)
+        bc2_x, bc2_u = self.bc2_sampler.sample(N)
+        # rearrange data
+        bc_x = np.concatenate([bc1_x, bc2_x])
+        bc_u = np.concatenate([bc1_u, bc2_u])
+        return torch.tensor(bc_x, dtype=torch.float32), torch.tensor(bc_u, dtype=torch.float32)
+
+    def get_ic_batch(self, N):
+        # sample points from initial condition
+        ic_x, ic_u = self.ic_sampler.sample(N)
+        return torch.tensor(ic_x, dtype=torch.float32), torch.tensor(ic_u, dtype=torch.float32)
+
+    def get_test_batch(self, N):
+        # sample batch for test
+        # X_star size = [N, 1], velocity_ref size = [N, 1]
+        nn = int(N ** (0.5))
+        # generate mesh
+        x1 = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        x2 = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x1, x2 = np.meshgrid(x1, x2)
+        x_star = np.hstack((x1.flatten()[:, None], x2.flatten()[:, None]))
+        u_star = self.u(x_star)
+        return (torch.tensor(x_star, dtype=torch.float32),
+                torch.tensor(u_star, dtype=torch.float32))
+
+    def get_img_batch(self, N):
+        # X_star size = [sqrt(N), sqrt(N)], velocity_ref size = [sqrt(N), sqrt(N)]
+        nn = int(N ** 0.5)
+        # generate mesh
+        x1 = np.linspace(self.bound_l, self.bound_r, nn)[:, None]
+        x2 = np.linspace(self.bound_d, self.bound_t, nn)[:, None]
+        x1, x2 = np.meshgrid(x1, x2)
+        # rearrange data
+        x_star = np.hstack((x1.flatten()[:, None], x2.flatten()[:, None]))
+        u_star = self.u(x_star)
+        # (100, 100) (100, 100) (10000, 2) (10000, 1)
+        return x1, x2, x_star, u_star
+
+
+if __name__ == '__main__':
+    # load device
+    device = torch.device(f"cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"Use GPU: {torch.cuda.is_available()}\n")
+    # create save path
+    save_path = f"../output/Klein-Gordon-a={a}/DFSNet/"
+    log_path, model_path, pic_path = create_save_path(save_path)
+    # load dataset
+    dataset = DatasetKG(a, bound_l, bound_r, bound_t, bound_d)
+    X_star, U_star = dataset.get_test_batch(10000)
+    # create model
+    network = NeuralNetwork(X_star, layers, device).to(device)
+    pinn = PINNKG(network, dataset, batch_size, bound_weight, ic_weight, log_path, model_path, pic_path,
+                           device)
+    # train model
+    pinn.train(lr_rate=1e-3, decay_factor=0.5, total_it=15010, print_it=10, evaluate_it=100, pic_it=1000, lr_it=10000)
